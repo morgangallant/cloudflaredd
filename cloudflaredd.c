@@ -94,7 +94,6 @@ static void init_sockaddr(struct sockaddr_in *a, struct in_addr dst, int p) {
 
 // Initialize a stun client for a given server address.
 static stun_client_t *stun_client_create(const stun_addr_t *address) {
-  // Resolve the remote address.
   struct addrinfo *results = NULL;
   struct addrinfo hints = {};
   hints.ai_family = AF_INET;
@@ -239,6 +238,7 @@ typedef struct {
   char *type;
   char *zone;
   char *api_token;
+  bool proxied;
 } cf_dns_record_t;
 
 // The set of dns records to update with our new public address.
@@ -247,7 +247,8 @@ static cf_dns_record_t cf_target_dns_records[] = {
      .name = "dev.operand.ai",
      .type = "A",
      .zone = "93e92444acf566f86d90d198a60c9e52",
-     .api_token = "y8GUmL6ba49i6nEFTEABY9xZIvNmiGux_4USPLO-"}};
+     .api_token = "y8GUmL6ba49i6nEFTEABY9xZIvNmiGux_4USPLO-",
+     .proxied = false}};
 
 // Construct a query url for retrieving an identifier from a dns record.
 static char *cf_construct_query_url(cf_dns_record_t *rec) {
@@ -263,7 +264,7 @@ static char *cf_construct_query_url(cf_dns_record_t *rec) {
 }
 
 // Construct an authorization token header string for the cloudflare request.
-static char *cf_construct_auth_token(cf_dns_record_t *rec) {
+static char *cf_construct_auth_token(const cf_dns_record_t *rec) {
   size_t token_len = 23 + strlen(rec->api_token);
   char *token = malloc((token_len + 1) * sizeof(char));
   snprintf(token, token_len, "Authorization: Bearer %s", rec->api_token);
@@ -274,21 +275,31 @@ static char *cf_construct_auth_token(cf_dns_record_t *rec) {
 typedef struct {
   char *data;
   size_t len;
-} cf_response_t;
+} cf_message_t;
 
-// Initialize a cf_response_t to default values.
-static cf_response_t *cf_response_init() {
-  cf_response_t *resp = malloc(sizeof(cf_response_t));
+// Initialize a cf_message_t to default values.
+static cf_message_t *cf_message_init() {
+  cf_message_t *resp = malloc(sizeof(cf_message_t));
   resp->data = strdup("");
   resp->len = 0;
   return resp;
 }
 
-// CURL callback function for storing response in cf_response_t object.
+// Cleans up any allocated memory from a cf_message_t.
+static void cf_message_cleanup(cf_message_t **msg) {
+  if (!(*msg))
+    return;
+  if ((*msg)->data)
+    free((*msg)->data);
+  free(*msg);
+  *msg = NULL;
+}
+
+// CURL callback function for storing response in cf_message_t object.
 // Credit: https://curl.haxx.se/libcurl/c/postinmemory.html
 static size_t cf_mem_write_cb(void *resp, size_t size, size_t nmemb, void *up) {
   size_t real_size = size * nmemb;
-  cf_response_t *resp_buf = (cf_response_t *)up;
+  cf_message_t *resp_buf = (cf_message_t *)up;
 
   resp_buf->data = realloc(resp_buf->data, resp_buf->len + real_size + 1);
   assert(resp_buf->data != NULL);
@@ -299,40 +310,48 @@ static size_t cf_mem_write_cb(void *resp, size_t size, size_t nmemb, void *up) {
   return real_size;
 }
 
-// Update a dns record structure with its identifier.
-static bool cf_get_identifier(cf_dns_record_t *record) {
+// Configures a cloudflare api request with libcurl.
+static CURL *cf_setup_request(const char *url, const cf_dns_record_t *record,
+                              cf_message_t *dest) {
   CURL *curl = curl_easy_init();
   if (!curl)
-    return false;
+    return NULL;
 
-  // Used to indicate success or failure.
-  bool ret_val = false;
-
-  char *url = cf_construct_query_url(record);
-  assert(url != NULL);
   curl_easy_setopt(curl, CURLOPT_URL, url);
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
-  struct curl_slist *headers = NULL;
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cf_mem_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)dest);
+
+  return curl;
+}
+
+// Update a dns record structure with its identifier.
+static bool cf_get_identifier(cf_dns_record_t *record) {
+  bool ret_val = false;
+
+  char *url = cf_construct_query_url(record);
   char *token = cf_construct_auth_token(record);
-  assert(token != NULL);
+  cf_message_t *resp = cf_message_init();
+
+  CURL *curl;
+  CURLcode res;
+  struct curl_slist *headers = NULL;
+
+  curl = cf_setup_request(url, record, resp);
+  if (!curl)
+    goto cleanup;
+
   headers = curl_slist_append(headers, token);
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-  cf_response_t *resp = cf_response_init();
-  assert(resp != NULL);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cf_mem_write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)resp);
-
-  CURLcode res = curl_easy_perform(curl);
+  res = curl_easy_perform(curl);
   if (res != CURLE_OK)
     goto cleanup;
 
-  // Copy the identifier from the response JSON.
   record->identifer = malloc(33 * sizeof(char));
   memcpy(record->identifer, resp->data + 18, 32);
 
-  // Indicate success.
   ret_val = true;
 
 cleanup:
@@ -341,7 +360,7 @@ cleanup:
   if (token)
     free(token);
   if (resp)
-    free(resp);
+    cf_message_cleanup(&resp);
   curl_easy_cleanup(curl);
   curl_slist_free_all(headers);
   return ret_val;
@@ -360,14 +379,102 @@ static bool cf_fill_identifiers(cf_dns_record_t *records, size_t count) {
   return true;
 }
 
+static char *cf_format_up_url(const cf_dns_record_t *record) {
+  // Sanity check.
+  if (!record->identifer)
+    return NULL;
+
+  size_t len = strlen(record->zone) + strlen(record->identifer);
+  len += 57;
+  char *buffer = malloc((len + 1) * sizeof(char));
+  snprintf(buffer, len,
+           "https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s",
+           record->zone, record->identifer);
+  buffer[len] = '\0';
+  return buffer;
+}
+
+// A macro to easily format a boolean as a string.
+#define BOOL_STR(x) ((x) ? "true" : "false")
+
+// Creates a request json object to update an existing dns record.
+static char *cf_format_up_req(const cf_dns_record_t *rec, const char *content) {
+  const char *p = BOOL_STR(rec->proxied);
+  size_t len =
+      strlen(rec->type) + strlen(rec->name) + strlen(content) + strlen(p);
+  len += 54;
+  char *msg = malloc((len + 1) * sizeof(char));
+  snprintf(msg, len,
+           "{\"type\":\"%s\",\"name\":\"%s\",\"content\":\"%s\",\"ttl\":1,"
+           "\"proxied\":%s}",
+           rec->type, rec->name, content, p);
+  msg[len] = '\0';
+  return msg;
+}
+
+// Updates the contents of a cloudflare dns record with new content.
+static bool cf_update_content(const cf_dns_record_t *record,
+                              const char *content) {
+  bool ret_val = false;
+
+  char *url = cf_format_up_url(record);
+  char *req_data = cf_format_up_req(record, content);
+  char *token = cf_construct_auth_token(record);
+  cf_message_t *resp = cf_message_init();
+
+  CURL *curl;
+  CURLcode res;
+  struct curl_slist *headers = NULL;
+
+  curl = cf_setup_request(url, record, resp);
+  if (!curl)
+    goto cleanup;
+
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+  headers = curl_slist_append(headers, token);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_data);
+  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+
+  res = curl_easy_perform(curl);
+  if (res != CURLE_OK)
+    goto cleanup;
+
+  printf("Got Response: %s\n", resp->data);
+
+cleanup:
+  if (url)
+    free(url);
+  if (req_data)
+    free(req_data);
+  if (token)
+    free(token);
+  if (resp)
+    cf_message_cleanup(&resp);
+  curl_easy_cleanup(curl);
+  curl_slist_free_all(headers);
+  return ret_val;
+}
+
+// int main() {
+//   curl_global_init(CURL_GLOBAL_ALL);
+//   srand(time(NULL));
+//   const char *ip = stun_get_pub_ip(GOOGLE_STUN_ADDR);
+//   printf("IP: %s\n", ip);
+//   size_t num_records = ARRAY_LEN(cf_target_dns_records);
+//   bool res = cf_fill_identifiers(cf_target_dns_records, num_records);
+//   if (!res)
+//     printf("Curl request failed.\n");
+//   return 0;
+// }
+
 int main() {
-  curl_global_init(CURL_GLOBAL_ALL);
-  srand(time(NULL));
-  const char *ip = stun_get_pub_ip(GOOGLE_STUN_ADDR);
-  printf("IP: %s\n", ip);
-  size_t num_records = ARRAY_LEN(cf_target_dns_records);
-  bool res = cf_fill_identifiers(cf_target_dns_records, num_records);
+  bool res = cf_get_identifier(&cf_target_dns_records[0]);
   if (!res)
-    printf("Curl request failed.\n");
+    printf("Failed to get identifier.");
+  res = cf_update_content(&cf_target_dns_records[0], "69.69.1.1");
+  if (!res)
+    printf("Failed to update content.");
   return 0;
 }
