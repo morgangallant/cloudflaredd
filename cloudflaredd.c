@@ -21,12 +21,14 @@
  */
 #include <arpa/inet.h>
 #include <assert.h>
+#include <curl/curl.h>
 #include <netdb.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* STUN Implementation */
@@ -231,8 +233,140 @@ done:
 
 /* Cloudflare API Implementation */
 
+typedef struct {
+  char *identifer;
+  char *name;
+  char *type;
+  char *zone;
+  char *api_token;
+} cf_dns_record_t;
+
+// The set of dns records to update with our new public address.
+static cf_dns_record_t cf_target_dns_records[] = {
+    {.identifer = NULL,
+     .name = "dev.operand.ai",
+     .type = "A",
+     .zone = "93e92444acf566f86d90d198a60c9e52",
+     .api_token = "y8GUmL6ba49i6nEFTEABY9xZIvNmiGux_4USPLO-"}};
+
+// Construct a query url for retrieving an identifier from a dns record.
+static char *cf_construct_query_url(cf_dns_record_t *rec) {
+  size_t url_len = strlen(rec->name) + strlen(rec->type) + strlen(rec->zone);
+  url_len += 68;
+  char *url = malloc((url_len + 1) * sizeof(char)); // null terminator + 1
+  snprintf(url, url_len,
+           "https://api.cloudflare.com/client/v4/zones/%s/"
+           "dns_records?type=%s&name=%s",
+           rec->zone, rec->type, rec->name);
+  url[url_len] = '\0';
+  return url;
+}
+
+// Construct an authorization token header string for the cloudflare request.
+static char *cf_construct_auth_token(cf_dns_record_t *rec) {
+  size_t token_len = 23 + strlen(rec->api_token);
+  char *token = malloc((token_len + 1) * sizeof(char));
+  snprintf(token, token_len, "Authorization: Bearer %s", rec->api_token);
+  token[token_len] = '\0';
+  return token;
+}
+
+typedef struct {
+  char *data;
+  size_t len;
+} cf_response_t;
+
+// Initialize a cf_response_t to default values.
+static cf_response_t *cf_response_init() {
+  cf_response_t *resp = malloc(sizeof(cf_response_t));
+  resp->data = strdup("");
+  resp->len = 0;
+  return resp;
+}
+
+// CURL callback function for storing response in cf_response_t object.
+static size_t cf_mem_write_cb(void *resp, size_t size, size_t nmemb, void *up) {
+  size_t real_size = size * nmemb;
+  cf_response_t *resp_buf = (cf_response_t *)up;
+
+  resp_buf->data = realloc(resp_buf->data, resp_buf->len + real_size + 1);
+  assert(resp_buf->data != NULL);
+
+  memcpy(&(resp_buf->data[resp_buf->len]), resp, real_size);
+  resp_buf->len += real_size;
+  resp_buf->data[resp_buf->len] = '\0';
+  return real_size;
+}
+
+// Update a dns record structure with its identifier.
+static bool cf_get_identifier(cf_dns_record_t *record) {
+  CURL *curl = curl_easy_init();
+  if (!curl)
+    return false;
+
+  // Used to indicate success or failure.
+  bool ret_val = false;
+
+  char *url = cf_construct_query_url(record);
+  assert(url != NULL);
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+  struct curl_slist *headers = NULL;
+  char *token = cf_construct_auth_token(record);
+  assert(token != NULL);
+  headers = curl_slist_append(headers, token);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+  cf_response_t *resp = cf_response_init();
+  assert(resp != NULL);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cf_mem_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)resp);
+
+  CURLcode res = curl_easy_perform(curl);
+  if (res != CURLE_OK)
+    goto cleanup;
+
+  // Copy the identifier from the response JSON.
+  record->identifer = malloc(33 * sizeof(char));
+  memcpy(record->identifer, resp->data + 18, 32);
+
+  // Indicate success.
+  ret_val = true;
+
+cleanup:
+  if (url)
+    free(url);
+  if (token)
+    free(token);
+  if (resp)
+    free(resp);
+  curl_easy_cleanup(curl);
+  curl_slist_free_all(headers);
+  return ret_val;
+}
+
+// A compile-time constant macro for finding the size of an array.
+#define ARRAY_LEN(arr) (sizeof(arr) / sizeof(arr[0]))
+
+// Fill all the identifiers for an array of dns records.
+static bool cf_fill_identifiers(cf_dns_record_t *records, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    bool res = cf_get_identifier(&records[i]);
+    if (!res)
+      return false;
+  }
+  return true;
+}
+
 int main() {
+  curl_global_init(CURL_GLOBAL_ALL);
+  srand(time(NULL));
   const char *ip = stun_get_pub_ip(GOOGLE_STUN_ADDR);
   printf("IP: %s\n", ip);
+  size_t num_records = ARRAY_LEN(cf_target_dns_records);
+  bool res = cf_fill_identifiers(cf_target_dns_records, num_records);
+  if (!res)
+    printf("Curl request failed.\n");
   return 0;
 }
