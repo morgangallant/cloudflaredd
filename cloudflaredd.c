@@ -330,6 +330,10 @@ static CURL *cf_setup_request(const char *url, const cf_dns_record_t *record,
 static bool cf_get_identifier(cf_dns_record_t *record) {
   bool ret_val = false;
 
+  // Fast path, we already have an identifier for this record.
+  if (record->identifer != NULL && strlen(record->identifer) != 0)
+    return true;
+
   char *url = cf_construct_query_url(record);
   char *token = cf_construct_auth_token(record);
   cf_message_t *resp = cf_message_init();
@@ -397,7 +401,7 @@ static char *cf_format_up_url(const cf_dns_record_t *record) {
 // A macro to easily format a boolean as a string.
 #define BOOL_STR(x) ((x) ? "true" : "false")
 
-// Creates a request json object to update an existing dns record.
+// Creates a request json object to update an existing dns record.xx
 static char *cf_format_up_req(const cf_dns_record_t *rec, const char *content) {
   const char *p = BOOL_STR(rec->proxied);
   size_t len =
@@ -441,7 +445,7 @@ static bool cf_update_content(const cf_dns_record_t *record,
   if (res != CURLE_OK)
     goto cleanup;
 
-  printf("Got Response: %s\n", resp->data);
+  ret_val = true;
 
 cleanup:
   if (url)
@@ -457,24 +461,50 @@ cleanup:
   return ret_val;
 }
 
-// int main() {
-//   curl_global_init(CURL_GLOBAL_ALL);
-//   srand(time(NULL));
-//   const char *ip = stun_get_pub_ip(GOOGLE_STUN_ADDR);
-//   printf("IP: %s\n", ip);
-//   size_t num_records = ARRAY_LEN(cf_target_dns_records);
-//   bool res = cf_fill_identifiers(cf_target_dns_records, num_records);
-//   if (!res)
-//     printf("Curl request failed.\n");
-//   return 0;
-// }
+// Updates all the cloudflare records with new content.
+static bool cf_update_all(cf_dns_record_t *records, size_t count,
+                          const char *content) {
+  for (int i = 0; i < count; ++i) {
+    bool res = cf_update_content(&records[i], content);
+    if (!res) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Check if this computers public address changed.
+static bool pub_ip_did_change(char *prev_ip) {
+  const char *curr_ip = stun_get_pub_ip(GOOGLE_STUN_ADDR);
+  if (strcmp(prev_ip, curr_ip) == 0)
+    return false;
+
+  strcpy(prev_ip, curr_ip);
+  return true;
+}
 
 int main() {
-  bool res = cf_get_identifier(&cf_target_dns_records[0]);
-  if (!res)
-    printf("Failed to get identifier.");
-  res = cf_update_content(&cf_target_dns_records[0], "69.69.1.1");
-  if (!res)
-    printf("Failed to update content.");
-  return 0;
+  curl_global_init(CURL_GLOBAL_ALL);
+  srand(time(NULL));
+
+  char public_addr[INET_ADDRSTRLEN] = {'\0'};
+  while (true) {
+    if (pub_ip_did_change(public_addr)) {
+      size_t num_records = ARRAY_LEN(cf_target_dns_records);
+      bool res = cf_fill_identifiers(cf_target_dns_records, num_records);
+      if (!res) {
+        printf("Failed to fill identifiers for target dns records.\n");
+        break;
+      }
+      res = cf_update_all(cf_target_dns_records, num_records, public_addr);
+      if (!res) {
+        printf("Failed to update dns records with new content.");
+        break;
+      }
+      printf("Updated records for new IP: %s.\n", public_addr);
+    }
+    sleep(180); // 180 seconds = 3 mins
+  }
+
+  curl_global_cleanup();
 }
