@@ -252,10 +252,10 @@ typedef struct {
 // The set of dns records to update with our new public address.
 static cf_dns_record_t cf_target_dns_records[] = {
     {.identifer = NULL,
-     .name = "dev.operand.ai",
+     .name = "your-cool-domain.com",
      .type = "A",
-     .zone = "93e92444acf566f86d90d198a60c9e52",
-     .api_token = "y8GUmL6ba49i6nEFTEABY9xZIvNmiGux_4USPLO-",
+     .zone = "zone-id-goes-here",
+     .api_token = "your-api-token-goes-here",
      .proxied = false}};
 
 // Construct a query url for retrieving an identifier from a dns record.
