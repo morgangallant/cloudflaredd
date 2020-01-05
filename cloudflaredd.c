@@ -119,9 +119,11 @@ static stun_client_t *stun_client_create(const stun_addr_t *address) {
              sizeof(resp->localaddr));
   if (res != 0) {
     free(resp);
+    freeaddrinfo(results);
     return NULL;
   }
 
+  freeaddrinfo(results);
   return resp;
 }
 
@@ -206,7 +208,13 @@ static char *stun_client_read_response(stun_client_t *client) {
 }
 
 // Cleanup the stun client by closing the bound socket.
-static void stun_client_cleanup(stun_client_t *client) { close(client->fd); }
+static void stun_client_cleanup(stun_client_t **client) {
+  if (!(*client))
+    return;
+  close((*client)->fd);
+  free(*client);
+  *client = NULL;
+}
 
 // The address of the public Google-hosted stun server to use.
 #define GOOGLE_STUN_ADDR "stun.l.google.com:19302"
@@ -226,7 +234,7 @@ static char *stun_get_pub_ip(const char *stun_server_addr) {
 
 done:
   stun_addr_free(&addr);
-  stun_client_cleanup(client);
+  stun_client_cleanup(&client);
   return pub_ip;
 }
 
@@ -475,11 +483,12 @@ static bool cf_update_all(cf_dns_record_t *records, size_t count,
 
 // Check if this computers public address changed.
 static bool pub_ip_did_change(char *prev_ip) {
-  const char *curr_ip = stun_get_pub_ip(GOOGLE_STUN_ADDR);
+  char *curr_ip = stun_get_pub_ip(GOOGLE_STUN_ADDR);
   if (strcmp(prev_ip, curr_ip) == 0)
     return false;
 
   strcpy(prev_ip, curr_ip);
+  free(curr_ip);
   return true;
 }
 
@@ -505,6 +514,11 @@ int main() {
     }
     sleep(180); // 180 seconds = 3 mins
   }
+
+  // Makes valgrind happy
+  for (int i = 0; i < ARRAY_LEN(cf_target_dns_records); ++i)
+    if (cf_target_dns_records[i].identifer)
+      free(cf_target_dns_records[i].identifer);
 
   curl_global_cleanup();
 }
