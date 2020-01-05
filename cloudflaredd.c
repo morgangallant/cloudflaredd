@@ -285,6 +285,7 @@ static cf_response_t *cf_response_init() {
 }
 
 // CURL callback function for storing response in cf_response_t object.
+// Credit: https://curl.haxx.se/libcurl/c/postinmemory.html
 static size_t cf_mem_write_cb(void *resp, size_t size, size_t nmemb, void *up) {
   size_t real_size = size * nmemb;
   cf_response_t *resp_buf = (cf_response_t *)up;
