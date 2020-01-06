@@ -41,6 +41,8 @@ static cf_dns_record_t cf_target_dns_records[] = {
     };
 ```
 
+If it would benefit people, I'd gladly improve on the configuration aspect of cloudflaredd. Perhaps a .toml file or .yml file to describe the configuration, rather than having to compile it in. Let me know!
+
 ## Support / Future Features
 
 As always, feel free to submit issues / pull requests to better the codebase. This is a small project that I needed to do for my tower, since my apartment doesn't have a static ip address. If you want to get in contact, send me an [email](mailto:morgan@morgangallant.com)!
