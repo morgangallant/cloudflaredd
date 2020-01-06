@@ -1,0 +1,11 @@
+[Unit]
+Description=Cloudflare DDNS
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/morgan/Desktop/cloudflaredd/cloudflaredd # CHANGE THIS LINE
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
